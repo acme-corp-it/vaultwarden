@@ -23,7 +23,7 @@ pub use crate::api::{
     icons::routes as icons_routes,
     identity::routes as identity_routes,
     notifications::routes as notifications_routes,
-    notifications::{start_notification_server, AnonymousNotify, Notify, UpdateType, WS_ANONYMOUS_SUBSCRIPTIONS},
+    notifications::{AnonymousNotify, Notify, UpdateType, WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS},
     push::{
         push_cipher_update, push_folder_update, push_logout, push_send_update, push_user_update, register_push_device,
         unregister_push_device,
@@ -71,32 +71,5 @@ impl PasswordOrOtpData {
             _ => err!("No validation provided"),
         }
         Ok(())
-    }
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[serde(untagged)]
-enum NumberOrString {
-    Number(i32),
-    String(String),
-}
-
-impl NumberOrString {
-    fn into_string(self) -> String {
-        match self {
-            NumberOrString::Number(n) => n.to_string(),
-            NumberOrString::String(s) => s,
-        }
-    }
-
-    #[allow(clippy::wrong_self_convention)]
-    fn into_i32(&self) -> ApiResult<i32> {
-        use std::num::ParseIntError as PIE;
-        match self {
-            NumberOrString::Number(n) => Ok(*n),
-            NumberOrString::String(s) => {
-                s.parse().map_err(|e: PIE| crate::Error::new("Can't convert to number", e.to_string()))
-            }
-        }
     }
 }

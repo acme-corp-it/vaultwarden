@@ -39,7 +39,6 @@ macro_rules! make_config {
 
         struct Inner {
             rocket_shutdown_handle: Option<rocket::Shutdown>,
-            ws_shutdown_handle: Option<tokio::sync::oneshot::Sender<()>>,
 
             templates: Handlebars<'static>,
             config: ConfigItems,
@@ -361,7 +360,7 @@ make_config! {
         /// Sends folder
         sends_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "sends");
         /// Temp folder |> Used for storing temporary file uploads
-        tmp_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "tmp");
+        tmp_folder:             String, false,  auto,   |c| format!("{}/{}", c.data_folder, "tmp");
         /// Templates folder
         templates_folder:       String, false,  auto,   |c| format!("{}/{}", c.data_folder, "templates");
         /// Session JWT key
@@ -371,11 +370,7 @@ make_config! {
     },
     ws {
         /// Enable websocket notifications
-        websocket_enabled:      bool,   false,  def,    false;
-        /// Websocket address
-        websocket_address:      String, false,  def,    "0.0.0.0".to_string();
-        /// Websocket port
-        websocket_port:         u16,    false,  def,    3012;
+        enable_websocket:       bool,   false,  def,    true;
     },
     push {
         /// Enable push notifications
@@ -442,6 +437,8 @@ make_config! {
         user_attachment_limit:  i64,    true,   option;
         /// Per-organization attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per org. When this limit is reached, org members will not be allowed to upload further attachments for ciphers owned by that org.
         org_attachment_limit:   i64,    true,   option;
+        /// Per-user send storage limit (KB) |> Max kilobytes of sends storage allowed per user. When this limit is reached, the user will not be allowed to upload further sends.
+        user_send_limit:   i64,    true,   option;
 
         /// Trash auto-delete days |> Number of days to wait before auto-deleting a trashed item.
         /// If unset, trashed items are not auto-deleted. This setting applies globally, so make
@@ -689,6 +686,10 @@ make_config! {
         email_expiration_time:  u64,    true,   def,      600;
         /// Maximum attempts |> Maximum attempts before an email token is reset and a new email will need to be sent
         email_attempts_limit:   u64,    true,   def,      3;
+        /// Automatically enforce at login |> Setup email 2FA provider regardless of any organization policy
+        email_2fa_enforce_on_verified_invite: bool,   true,   def,      false;
+        /// Auto-enable 2FA (Know the risks!) |> Automatically setup email 2FA as fallback provider when needed
+        email_2fa_auto_fallback: bool,  true,   def,      false;
     },
 }
 
@@ -776,11 +777,34 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         }
     }
 
+    // TODO: deal with deprecated flags so they can be removed from this list, cf. #4263
     const KNOWN_FLAGS: &[&str] =
         &["autofill-overlay", "autofill-v2", "browser-fileless-import", "fido2-vault-credentials"];
-    for flag in parse_experimental_client_feature_flags(&cfg.experimental_client_feature_flags).keys() {
-        if !KNOWN_FLAGS.contains(&flag.as_str()) {
-            warn!("The experimental client feature flag {flag:?} is unrecognized. Please ensure the feature flag is spelled correctly and that it is supported in this version.");
+    let configured_flags = parse_experimental_client_feature_flags(&cfg.experimental_client_feature_flags);
+    let invalid_flags: Vec<_> = configured_flags.keys().filter(|flag| !KNOWN_FLAGS.contains(&flag.as_str())).collect();
+    if !invalid_flags.is_empty() {
+        err!(format!("Unrecognized experimental client feature flags: {invalid_flags:?}.\n\n\
+                     Please ensure all feature flags are spelled correctly and that they are supported in this version.\n\
+                     Supported flags: {KNOWN_FLAGS:?}"));
+    }
+
+    const MAX_FILESIZE_KB: i64 = i64::MAX >> 10;
+
+    if let Some(limit) = cfg.user_attachment_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`USER_ATTACHMENT_LIMIT` is out of bounds");
+        }
+    }
+
+    if let Some(limit) = cfg.org_attachment_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`ORG_ATTACHMENT_LIMIT` is out of bounds");
+        }
+    }
+
+    if let Some(limit) = cfg.user_send_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`USER_SEND_LIMIT` is out of bounds");
         }
     }
 
@@ -866,6 +890,13 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
 
     if cfg._enable_email_2fa && !(cfg.smtp_host.is_some() || cfg.use_sendmail) {
         err!("To enable email 2FA, a mail transport must be configured")
+    }
+
+    if !cfg._enable_email_2fa && cfg.email_2fa_enforce_on_verified_invite {
+        err!("To enforce email 2FA on verified invitations, email 2fa has to be enabled!");
+    }
+    if !cfg._enable_email_2fa && cfg.email_2fa_auto_fallback {
+        err!("To use email 2FA as automatic fallback, email 2fa has to be enabled!");
     }
 
     // Check if the icon blacklist regex is valid
@@ -1046,7 +1077,6 @@ impl Config {
         Ok(Config {
             inner: RwLock::new(Inner {
                 rocket_shutdown_handle: None,
-                ws_shutdown_handle: None,
                 templates: load_templates(&config.templates_folder),
                 config,
                 _env,
@@ -1139,7 +1169,7 @@ impl Config {
     }
 
     pub fn delete_user_config(&self) -> Result<(), Error> {
-        crate::util::delete_file(&CONFIG_FILE)?;
+        std::fs::remove_file(&*CONFIG_FILE)?;
 
         // Empty user config
         let usr = ConfigBuilder::default();
@@ -1163,9 +1193,6 @@ impl Config {
 
     pub fn private_rsa_key(&self) -> String {
         format!("{}.pem", CONFIG.rsa_key_filename())
-    }
-    pub fn public_rsa_key(&self) -> String {
-        format!("{}.pub.pem", CONFIG.rsa_key_filename())
     }
     pub fn mail_enabled(&self) -> bool {
         let inner = &self.inner.read().unwrap().config;
@@ -1215,16 +1242,8 @@ impl Config {
         self.inner.write().unwrap().rocket_shutdown_handle = Some(handle);
     }
 
-    pub fn set_ws_shutdown_handle(&self, handle: tokio::sync::oneshot::Sender<()>) {
-        self.inner.write().unwrap().ws_shutdown_handle = Some(handle);
-    }
-
     pub fn shutdown(&self) {
         if let Ok(mut c) = self.inner.write() {
-            if let Some(handle) = c.ws_shutdown_handle.take() {
-                handle.send(()).ok();
-            }
-
             if let Some(handle) = c.rocket_shutdown_handle.take() {
                 handle.notify();
             }

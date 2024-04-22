@@ -1,12 +1,9 @@
 //
 // Web Headers and caching
 //
-use std::{
-    collections::HashMap,
-    io::{Cursor, ErrorKind},
-    ops::Deref,
-};
+use std::{collections::HashMap, io::Cursor, ops::Deref, path::Path};
 
+use num_traits::ToPrimitive;
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::{ContentType, Header, HeaderMap, Method, Status},
@@ -217,7 +214,7 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for Cache
         res.set_raw_header("Cache-Control", cache_control_header);
 
         let time_now = chrono::Local::now();
-        let expiry_time = time_now + chrono::Duration::seconds(self.ttl.try_into().unwrap());
+        let expiry_time = time_now + chrono::TimeDelta::try_seconds(self.ttl.try_into().unwrap()).unwrap();
         res.set_raw_header("Expires", format_datetime_http(&expiry_time));
         Ok(res)
     }
@@ -333,44 +330,14 @@ impl Fairing for BetterLogging {
     }
 }
 
-//
-// File handling
-//
-use std::{
-    fs::{self, File},
-    io::Result as IOResult,
-    path::Path,
-};
-
-pub fn file_exists(path: &str) -> bool {
-    Path::new(path).exists()
-}
-
-pub fn write_file(path: &str, content: &[u8]) -> Result<(), crate::error::Error> {
-    use std::io::Write;
-    let mut f = match File::create(path) {
-        Ok(file) => file,
-        Err(e) => {
-            if e.kind() == ErrorKind::PermissionDenied {
-                error!("Can't create '{}': Permission denied", path);
-            }
-            return Err(From::from(e));
-        }
-    };
-
-    f.write_all(content)?;
-    f.flush()?;
-    Ok(())
-}
-
-pub fn delete_file(path: &str) -> IOResult<()> {
-    fs::remove_file(path)
-}
-
-pub fn get_display_size(size: i32) -> String {
+pub fn get_display_size(size: i64) -> String {
     const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
 
-    let mut size: f64 = size.into();
+    // If we're somehow too big for a f64, just return the size in bytes
+    let Some(mut size) = size.to_f64() else {
+        return format!("{size} bytes");
+    };
+
     let mut unit_counter = 0;
 
     loop {
@@ -439,7 +406,7 @@ pub fn get_env_str_value(key: &str) -> Option<String> {
     match (value_from_env, value_file) {
         (Ok(_), Ok(_)) => panic!("You should not define both {key} and {key_file}!"),
         (Ok(v_env), Err(_)) => Some(v_env),
-        (Err(_), Ok(v_file)) => match fs::read_to_string(v_file) {
+        (Err(_), Ok(v_file)) => match std::fs::read_to_string(v_file) {
             Ok(content) => Some(content.trim().to_string()),
             Err(e) => panic!("Failed to load {key}: {e:?}"),
         },
@@ -526,14 +493,17 @@ pub fn parse_date(date: &str) -> NaiveDateTime {
 // Deployment environment methods
 //
 
-/// Returns true if the program is running in Docker or Podman.
-pub fn is_running_in_docker() -> bool {
-    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+/// Returns true if the program is running in Docker, Podman or Kubernetes.
+pub fn is_running_in_container() -> bool {
+    Path::new("/.dockerenv").exists()
+        || Path::new("/run/.containerenv").exists()
+        || Path::new("/run/secrets/kubernetes.io").exists()
+        || Path::new("/var/run/secrets/kubernetes.io").exists()
 }
 
-/// Simple check to determine on which docker base image vaultwarden is running.
+/// Simple check to determine on which container base image vaultwarden is running.
 /// We build images based upon Debian or Alpine, so these we check here.
-pub fn docker_base_image() -> &'static str {
+pub fn container_base_image() -> &'static str {
     if Path::new("/etc/debian_version").exists() {
         "Debian"
     } else if Path::new("/etc/alpine-release").exists() {
@@ -550,7 +520,7 @@ pub fn docker_base_image() -> &'static str {
 use std::fmt;
 
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::{self, Value};
+use serde_json::Value;
 
 pub type JsonMap = serde_json::Map<String, Value>;
 
@@ -638,6 +608,47 @@ fn _process_key(key: &str) -> String {
     }
 }
 
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum NumberOrString {
+    Number(i64),
+    String(String),
+}
+
+impl NumberOrString {
+    pub fn into_string(self) -> String {
+        match self {
+            NumberOrString::Number(n) => n.to_string(),
+            NumberOrString::String(s) => s,
+        }
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_i32(&self) -> Result<i32, crate::Error> {
+        use std::num::ParseIntError as PIE;
+        match self {
+            NumberOrString::Number(n) => match n.to_i32() {
+                Some(n) => Ok(n),
+                None => err!("Number does not fit in i32"),
+            },
+            NumberOrString::String(s) => {
+                s.parse().map_err(|e: PIE| crate::Error::new("Can't convert to number", e.to_string()))
+            }
+        }
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_i64(&self) -> Result<i64, crate::Error> {
+        use std::num::ParseIntError as PIE;
+        match self {
+            NumberOrString::Number(n) => Ok(*n),
+            NumberOrString::String(s) => {
+                s.parse().map_err(|e: PIE| crate::Error::new("Can't convert to number", e.to_string()))
+            }
+        }
+    }
+}
+
 //
 // Retry methods
 //
@@ -695,7 +706,7 @@ pub fn get_reqwest_client() -> Client {
         Ok(client) => client,
         Err(e) => {
             error!("Possible trust-dns error, trying with trust-dns disabled: '{e}'");
-            get_reqwest_client_builder().trust_dns(false).build().expect("Failed to build client")
+            get_reqwest_client_builder().hickory_dns(false).build().expect("Failed to build client")
         }
     }
 }

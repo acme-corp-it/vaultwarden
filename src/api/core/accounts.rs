@@ -5,13 +5,16 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        core::log_user_event, register_push_device, unregister_push_device, AnonymousNotify, EmptyResult, JsonResult,
-        JsonUpcase, Notify, NumberOrString, PasswordOrOtpData, UpdateType,
+        core::{log_user_event, two_factor::email},
+        register_push_device, unregister_push_device, AnonymousNotify, EmptyResult, JsonResult, JsonUpcase, Notify,
+        PasswordOrOtpData, UpdateType,
     },
     auth::{decode_delete, decode_invite, decode_verify_email, ClientHeaders, Headers},
     crypto,
     db::{models::*, DbConn},
-    mail, CONFIG,
+    mail,
+    util::NumberOrString,
+    CONFIG,
 };
 
 use rocket::{
@@ -101,6 +104,19 @@ fn enforce_password_hint_setting(password_hint: &Option<String>) -> EmptyResult 
         err!("Password hints have been disabled by the administrator. Remove the hint and try again.");
     }
     Ok(())
+}
+async fn is_email_2fa_required(org_user_uuid: Option<String>, conn: &mut DbConn) -> bool {
+    if !CONFIG._enable_email_2fa() {
+        return false;
+    }
+    if CONFIG.email_2fa_enforce_on_verified_invite() {
+        return true;
+    }
+    if org_user_uuid.is_some() {
+        return OrgPolicy::is_enabled_by_org(&org_user_uuid.unwrap(), OrgPolicyType::TwoFactorAuthentication, conn)
+            .await;
+    }
+    false
 }
 
 #[post("/accounts/register", data = "<data>")]
@@ -206,6 +222,10 @@ pub async fn _register(data: JsonUpcase<RegisterData>, mut conn: DbConn) -> Json
         } else if let Err(e) = mail::send_welcome(&user.email).await {
             error!("Error sending welcome email: {:#?}", e);
         }
+
+        if verified_by_invite && is_email_2fa_required(data.OrganizationUserId, &mut conn).await {
+            let _ = email::activate_email_2fa(&user, &mut conn).await;
+        }
     }
 
     user.save(&mut conn).await?;
@@ -279,8 +299,9 @@ async fn put_avatar(data: JsonUpcase<AvatarData>, headers: Headers, mut conn: Db
 #[get("/users/<uuid>/public-key")]
 async fn get_public_keys(uuid: &str, _headers: Headers, mut conn: DbConn) -> JsonResult {
     let user = match User::find_by_uuid(uuid, &mut conn).await {
-        Some(user) => user,
-        None => err!("User doesn't exist"),
+        Some(user) if user.public_key.is_some() => user,
+        Some(_) => err_code!("User has no public_key", Status::NotFound.code),
+        None => err_code!("User doesn't exist", Status::NotFound.code),
     };
 
     Ok(Json(json!({
@@ -417,24 +438,46 @@ async fn post_kdf(data: JsonUpcase<ChangeKdfData>, headers: Headers, mut conn: D
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
 struct UpdateFolderData {
-    Id: String,
+    // There is a bug in 2024.3.x which adds a `null` item.
+    // To bypass this we allow a Option here, but skip it during the updates
+    // See: https://github.com/bitwarden/clients/issues/8453
+    Id: Option<String>,
     Name: String,
 }
 
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct UpdateEmergencyAccessData {
+    Id: String,
+    KeyEncrypted: String,
+}
+
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct UpdateResetPasswordData {
+    OrganizationId: String,
+    ResetPasswordKey: String,
+}
+
 use super::ciphers::CipherData;
+use super::sends::{update_send_from_data, SendData};
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
 struct KeyData {
     Ciphers: Vec<CipherData>,
     Folders: Vec<UpdateFolderData>,
+    Sends: Vec<SendData>,
+    EmergencyAccessKeys: Vec<UpdateEmergencyAccessData>,
+    ResetPasswordKeys: Vec<UpdateResetPasswordData>,
     Key: String,
-    PrivateKey: String,
     MasterPasswordHash: String,
+    PrivateKey: String,
 }
 
 #[post("/accounts/key", data = "<data>")]
 async fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    // TODO: See if we can wrap everything within a SQL Transaction. If something fails it should revert everything.
     let data: KeyData = data.into_inner().data;
 
     if !headers.user.check_valid_password(&data.MasterPasswordHash) {
@@ -451,37 +494,83 @@ async fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, mut conn: D
 
     // Update folder data
     for folder_data in data.Folders {
-        let mut saved_folder = match Folder::find_by_uuid(&folder_data.Id, &mut conn).await {
-            Some(folder) => folder,
-            None => err!("Folder doesn't exist"),
+        // Skip `null` folder id entries.
+        // See: https://github.com/bitwarden/clients/issues/8453
+        if let Some(folder_id) = folder_data.Id {
+            let mut saved_folder = match Folder::find_by_uuid(&folder_id, &mut conn).await {
+                Some(folder) => folder,
+                None => err!("Folder doesn't exist"),
+            };
+
+            if &saved_folder.user_uuid != user_uuid {
+                err!("The folder is not owned by the user")
+            }
+
+            saved_folder.name = folder_data.Name;
+            saved_folder.save(&mut conn).await?
+        }
+    }
+
+    // Update emergency access data
+    for emergency_access_data in data.EmergencyAccessKeys {
+        let mut saved_emergency_access = match EmergencyAccess::find_by_uuid(&emergency_access_data.Id, &mut conn).await
+        {
+            Some(emergency_access) => emergency_access,
+            None => err!("Emergency access doesn't exist"),
         };
 
-        if &saved_folder.user_uuid != user_uuid {
-            err!("The folder is not owned by the user")
+        if &saved_emergency_access.grantor_uuid != user_uuid {
+            err!("The emergency access is not owned by the user")
         }
 
-        saved_folder.name = folder_data.Name;
-        saved_folder.save(&mut conn).await?
+        saved_emergency_access.key_encrypted = Some(emergency_access_data.KeyEncrypted);
+        saved_emergency_access.save(&mut conn).await?
+    }
+
+    // Update reset password data
+    for reset_password_data in data.ResetPasswordKeys {
+        let mut user_org =
+            match UserOrganization::find_by_user_and_org(user_uuid, &reset_password_data.OrganizationId, &mut conn)
+                .await
+            {
+                Some(reset_password) => reset_password,
+                None => err!("Reset password doesn't exist"),
+            };
+
+        user_org.reset_password_key = Some(reset_password_data.ResetPasswordKey);
+        user_org.save(&mut conn).await?
+    }
+
+    // Update send data
+    for send_data in data.Sends {
+        let mut send = match Send::find_by_uuid(send_data.Id.as_ref().unwrap(), &mut conn).await {
+            Some(send) => send,
+            None => err!("Send doesn't exist"),
+        };
+
+        update_send_from_data(&mut send, send_data, &headers, &mut conn, &nt, UpdateType::None).await?;
     }
 
     // Update cipher data
     use super::ciphers::update_cipher_from_data;
 
     for cipher_data in data.Ciphers {
-        let mut saved_cipher = match Cipher::find_by_uuid(cipher_data.Id.as_ref().unwrap(), &mut conn).await {
-            Some(cipher) => cipher,
-            None => err!("Cipher doesn't exist"),
-        };
+        if cipher_data.OrganizationId.is_none() {
+            let mut saved_cipher = match Cipher::find_by_uuid(cipher_data.Id.as_ref().unwrap(), &mut conn).await {
+                Some(cipher) => cipher,
+                None => err!("Cipher doesn't exist"),
+            };
 
-        if saved_cipher.user_uuid.as_ref().unwrap() != user_uuid {
-            err!("The cipher is not owned by the user")
+            if saved_cipher.user_uuid.as_ref().unwrap() != user_uuid {
+                err!("The cipher is not owned by the user")
+            }
+
+            // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
+            // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
+            // We force the users to logout after the user has been saved to try and prevent these issues.
+            update_cipher_from_data(&mut saved_cipher, cipher_data, &headers, false, &mut conn, &nt, UpdateType::None)
+                .await?
         }
-
-        // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
-        // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
-        // We force the users to logout after the user has been saved to try and prevent these issues.
-        update_cipher_from_data(&mut saved_cipher, cipher_data, &headers, false, &mut conn, &nt, UpdateType::None)
-            .await?
     }
 
     // Update user data
@@ -556,6 +645,8 @@ async fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, mu
         if let Err(e) = mail::send_change_email(&data.NewEmail, &token).await {
             error!("Error sending change-email email: {:#?}", e);
         }
+    } else {
+        debug!("Email change request for user ({}) to email ({}) with token ({})", user.uuid, data.NewEmail, token);
     }
 
     user.email_new = Some(data.NewEmail);
@@ -750,7 +841,7 @@ async fn delete_account(data: JsonUpcase<PasswordOrOtpData>, headers: Headers, m
 
 #[get("/accounts/revision-date")]
 fn revision_date(headers: Headers) -> JsonResult {
-    let revision_date = headers.user.updated_at.timestamp_millis();
+    let revision_date = headers.user.updated_at.and_utc().timestamp_millis();
     Ok(Json(json!(revision_date)))
 }
 
@@ -949,26 +1040,33 @@ async fn post_device_token(uuid: &str, data: JsonUpcase<PushToken>, headers: Hea
 
 #[put("/devices/identifier/<uuid>/token", data = "<data>")]
 async fn put_device_token(uuid: &str, data: JsonUpcase<PushToken>, headers: Headers, mut conn: DbConn) -> EmptyResult {
-    if !CONFIG.push_enabled() {
-        return Ok(());
-    }
-
     let data = data.into_inner().data;
     let token = data.PushToken;
+
     let mut device = match Device::find_by_uuid_and_user(&headers.device.uuid, &headers.user.uuid, &mut conn).await {
         Some(device) => device,
         None => err!(format!("Error: device {uuid} should be present before a token can be assigned")),
     };
-    device.push_token = Some(token);
-    if device.push_uuid.is_none() {
-        device.push_uuid = Some(uuid::Uuid::new_v4().to_string());
+
+    // if the device already has been registered
+    if device.is_registered() {
+        // check if the new token is the same as the registered token
+        if device.push_token.is_some() && device.push_token.unwrap() == token.clone() {
+            debug!("Device {} is already registered and token is the same", uuid);
+            return Ok(());
+        } else {
+            // Try to unregister already registered device
+            let _ = unregister_push_device(device.push_uuid).await;
+        }
+        // clear the push_uuid
+        device.push_uuid = None;
     }
+    device.push_token = Some(token);
     if let Err(e) = device.save(&mut conn).await {
         err!(format!("An error occurred while trying to save the device push token: {e}"));
     }
-    if let Err(e) = register_push_device(headers.user.uuid, device).await {
-        err!(format!("An error occurred while proceeding registration of a device: {e}"));
-    }
+
+    register_push_device(&mut device, &mut conn).await?;
 
     Ok(())
 }
@@ -985,7 +1083,7 @@ async fn put_clear_device_token(uuid: &str, mut conn: DbConn) -> EmptyResult {
 
     if let Some(device) = Device::find_by_uuid(uuid, &mut conn).await {
         Device::clear_push_token_by_uuid(uuid, &mut conn).await?;
-        unregister_push_device(device.uuid).await?;
+        unregister_push_device(device.push_uuid).await?;
     }
 
     Ok(())

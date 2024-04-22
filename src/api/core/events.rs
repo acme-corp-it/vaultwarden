@@ -125,7 +125,7 @@ async fn get_user_events(
     })))
 }
 
-fn get_continuation_token(events_json: &Vec<Value>) -> Option<&str> {
+fn get_continuation_token(events_json: &[Value]) -> Option<&str> {
     // When the length of the vec equals the max page_size there probably is more data
     // When it is less, then all events are loaded.
     if events_json.len() as i64 == Event::PAGE_SIZE {
@@ -289,7 +289,7 @@ async fn _log_event(
     let mut event = Event::new(event_type, event_date);
     match event_type {
         // 1000..=1099 Are user events, they need to be logged via log_user_event()
-        // Collection Events
+        // Cipher Events
         1100..=1199 => {
             event.cipher_uuid = Some(String::from(source_uuid));
         }
